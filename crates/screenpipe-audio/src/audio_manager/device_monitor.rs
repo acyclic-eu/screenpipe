@@ -226,11 +226,12 @@ pub async fn start_device_monitor(
                     warn!("[DEVICE_RECOVERY] device list returned empty (transient SCK failure?), skipping availability checks this cycle");
                 }
                 let enabled_devices = audio_manager.enabled_devices().await;
+                let system_audio_disabled = audio_manager.disable_system_audio().await;
 
                 // Migrate legacy "Display N (output)" device names to "System Audio (output)".
                 // This handles upgrades from versions that tracked per-display output devices.
                 #[cfg(target_os = "macos")]
-                if !legacy_migrated {
+                if !legacy_migrated && !system_audio_disabled {
                     legacy_migrated = true;
                     let legacy_outputs: Vec<String> = enabled_devices
                         .iter()
@@ -304,46 +305,49 @@ pub async fn start_device_monitor(
                         }
 
                         // Sync output device (atomic swap: start new first)
-                        if let Ok(default_output) = default_output_device().await {
-                            let default_output_name = default_output.to_string();
-                            let current = audio_manager.enabled_devices().await;
-                            let has_correct_output = current.contains(&default_output_name);
+                        if !system_audio_disabled {
+                            if let Ok(default_output) = default_output_device().await {
+                                let default_output_name = default_output.to_string();
+                                let current = audio_manager.enabled_devices().await;
+                                let has_correct_output = current.contains(&default_output_name);
 
-                            if !has_correct_output {
-                                info!(
+                                if !has_correct_output {
+                                    info!(
                                     "[DEVICE_RECOVERY] initial sync: default output '{}' not active, switching",
                                     default_output_name
                                 );
-                                match audio_manager.start_device(&default_output).await {
-                                    Ok(()) => {
-                                        info!(
+                                    match audio_manager.start_device(&default_output).await {
+                                        Ok(()) => {
+                                            info!(
                                             "[DEVICE_RECOVERY] initial sync: started default output: {}",
                                             default_output_name
                                         );
-                                        // Stop other output devices
-                                        for device_name in current.iter() {
-                                            if *device_name == default_output_name {
-                                                continue;
-                                            }
-                                            if let Ok(device) = parse_audio_device(device_name) {
-                                                if device.device_type == DeviceType::Output {
-                                                    info!(
+                                            // Stop other output devices
+                                            for device_name in current.iter() {
+                                                if *device_name == default_output_name {
+                                                    continue;
+                                                }
+                                                if let Ok(device) = parse_audio_device(device_name)
+                                                {
+                                                    if device.device_type == DeviceType::Output {
+                                                        info!(
                                                         "[DEVICE_RECOVERY] initial sync: stopping non-default output: {}",
                                                         device_name
                                                     );
-                                                    let _ = audio_manager
-                                                        .stop_device(device_name)
-                                                        .await;
+                                                        let _ = audio_manager
+                                                            .stop_device(device_name)
+                                                            .await;
+                                                    }
                                                 }
                                             }
+                                            default_tracker.last_output = Some(default_output_name);
                                         }
-                                        default_tracker.last_output = Some(default_output_name);
-                                    }
-                                    Err(e) => {
-                                        warn!(
+                                        Err(e) => {
+                                            warn!(
                                             "[DEVICE_RECOVERY] initial sync: failed to start default output {}: {}",
                                             default_output_name, e
                                         );
+                                        }
                                     }
                                 }
                             }
@@ -354,24 +358,26 @@ pub async fn start_device_monitor(
                         // audio to this endpoint (often a USB headset) while the
                         // multimedia default might be a monitor or speakers.
                         #[cfg(target_os = "windows")]
-                        if let Some(comm_device) = default_communications_output_device() {
-                            let comm_name = comm_device.to_string();
-                            let current = audio_manager.enabled_devices().await;
-                            if !current.contains(&comm_name) {
-                                match audio_manager.start_device(&comm_device).await {
-                                    Ok(()) => {
-                                        info!(
+                        if !system_audio_disabled {
+                            if let Some(comm_device) = default_communications_output_device() {
+                                let comm_name = comm_device.to_string();
+                                let current = audio_manager.enabled_devices().await;
+                                if !current.contains(&comm_name) {
+                                    match audio_manager.start_device(&comm_device).await {
+                                        Ok(()) => {
+                                            info!(
                                             "[DEVICE_RECOVERY] initial sync: started communications output: {}",
                                             comm_name
                                         );
-                                        default_tracker.last_communications_output =
-                                            Some(comm_name);
-                                    }
-                                    Err(e) => {
-                                        warn!(
+                                            default_tracker.last_communications_output =
+                                                Some(comm_name);
+                                        }
+                                        Err(e) => {
+                                            warn!(
                                             "[DEVICE_RECOVERY] initial sync: failed to start communications output {}: {}",
                                             comm_name, e
                                         );
+                                        }
                                     }
                                 }
                             }
@@ -428,76 +434,83 @@ pub async fn start_device_monitor(
                     // Atomic swap: start new device FIRST, then stop old ones.
                     // This ensures continuous audio capture — if the new device
                     // fails to start, the old devices keep running as fallback.
-                    if let Some(new_default_output) = default_tracker.check_output_changed().await {
-                        // Skip if new default is user-disabled
-                        if audio_manager
-                            .user_disabled_devices()
-                            .await
-                            .contains(&new_default_output)
+                    if !system_audio_disabled {
+                        if let Some(new_default_output) =
+                            default_tracker.check_output_changed().await
                         {
-                            debug!("[DEVICE_RECOVERY] skipping default output change: {} is user-disabled", new_default_output);
-                        } else {
-                            info!(
-                                "[DEVICE_RECOVERY] system default output changed to: {}",
-                                new_default_output
-                            );
-
-                            let new_started = if let Ok(new_device) =
-                                parse_audio_device(&new_default_output)
+                            // Skip if new default is user-disabled
+                            if audio_manager
+                                .user_disabled_devices()
+                                .await
+                                .contains(&new_default_output)
                             {
-                                failed_devices.remove(&new_default_output);
-                                match audio_manager.start_device(&new_device).await {
-                                    Ok(()) => {
-                                        info!(
+                                debug!("[DEVICE_RECOVERY] skipping default output change: {} is user-disabled", new_default_output);
+                            } else {
+                                info!(
+                                    "[DEVICE_RECOVERY] system default output changed to: {}",
+                                    new_default_output
+                                );
+
+                                let new_started = if let Ok(new_device) =
+                                    parse_audio_device(&new_default_output)
+                                {
+                                    failed_devices.remove(&new_default_output);
+                                    match audio_manager.start_device(&new_device).await {
+                                        Ok(()) => {
+                                            info!(
                                         "[DEVICE_RECOVERY] started new system default output: {}",
                                         new_default_output
                                     );
-                                        true
-                                    }
-                                    Err(e) => {
-                                        warn!(
+                                            true
+                                        }
+                                        Err(e) => {
+                                            warn!(
                                             "[DEVICE_RECOVERY] failed to start new default output {}: {} — keeping old devices running",
                                             new_default_output, e
                                         );
-                                        false
+                                            false
+                                        }
                                     }
-                                }
-                            } else {
-                                false
-                            };
+                                } else {
+                                    false
+                                };
 
-                            // Only stop old output devices if the new one started successfully
-                            if new_started {
-                                // Don't stop the communications output device during swap
-                                #[cfg(target_os = "windows")]
-                                let comm_name = default_tracker.last_communications_output.clone();
-                                for device_name in audio_manager.enabled_devices().await.iter() {
-                                    if *device_name == new_default_output {
-                                        continue; // don't stop the one we just started
-                                    }
+                                // Only stop old output devices if the new one started successfully
+                                if new_started {
+                                    // Don't stop the communications output device during swap
                                     #[cfg(target_os = "windows")]
-                                    if comm_name.as_deref() == Some(device_name.as_str()) {
-                                        continue; // don't stop the communications device
-                                    }
-                                    if let Ok(device) = parse_audio_device(device_name) {
-                                        if device.device_type == DeviceType::Output {
-                                            info!(
+                                    let comm_name =
+                                        default_tracker.last_communications_output.clone();
+                                    for device_name in audio_manager.enabled_devices().await.iter()
+                                    {
+                                        if *device_name == new_default_output {
+                                            continue; // don't stop the one we just started
+                                        }
+                                        #[cfg(target_os = "windows")]
+                                        if comm_name.as_deref() == Some(device_name.as_str()) {
+                                            continue; // don't stop the communications device
+                                        }
+                                        if let Ok(device) = parse_audio_device(device_name) {
+                                            if device.device_type == DeviceType::Output {
+                                                info!(
                                                 "[DEVICE_RECOVERY] stopping old output device: {}",
                                                 device_name
                                             );
-                                            let _ = audio_manager.stop_device(device_name).await;
+                                                let _ =
+                                                    audio_manager.stop_device(device_name).await;
+                                            }
                                         }
                                     }
                                 }
-                            }
-                        } // else: skip user-disabled
+                            } // else: skip user-disabled
+                        }
                     }
 
                     // Windows: check if the eCommunications output device changed.
                     // This captures call audio from Teams/Zoom/etc. that routes to
                     // the communications endpoint (often a USB headset).
                     #[cfg(target_os = "windows")]
-                    {
+                    if !system_audio_disabled {
                         let old_comm = default_tracker.last_communications_output.clone();
                         if let Some(new_comm_output) =
                             default_tracker.check_communications_output_changed()
@@ -619,7 +632,7 @@ pub async fn start_device_monitor(
                     // Ensure an output device is actually running.
                     // Handles the case where ScreenCaptureKit wasn't ready at startup
                     // or output device was lost during a device change.
-                    {
+                    if !system_audio_disabled {
                         let current_enabled = audio_manager.enabled_devices().await;
                         let user_disabled = audio_manager.user_disabled_devices().await;
                         let has_output = current_enabled.iter().any(|name| {
@@ -871,6 +884,11 @@ pub async fn start_device_monitor(
                             continue;
                         }
                     };
+
+                    if device.device_type == DeviceType::Output && system_audio_disabled {
+                        disconnected_devices.remove(&device_name);
+                        continue;
+                    }
 
                     // In system default mode, try to restart with current default instead
                     if audio_manager.use_system_default_audio().await {

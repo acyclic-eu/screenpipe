@@ -25,7 +25,7 @@ use screenpipe_db::DatabaseManager;
 use super::{start_device_monitor, stop_device_monitor, AudioManagerOptions, TranscriptionMode};
 use crate::{
     core::{
-        device::{parse_audio_device, AudioDevice},
+        device::{parse_audio_device, AudioDevice, DeviceType},
         engine::AudioTranscriptionEngine,
         record_and_transcribe,
     },
@@ -63,6 +63,7 @@ use serde::{Deserialize, Serialize};
 /// Sentry during a sustained failure.
 static LAST_AUDIO_PROCESS_ERROR_EPOCH_SECS: AtomicU64 = AtomicU64::new(0);
 const AUDIO_PROCESS_ERROR_SENTRY_INTERVAL_SECS: u64 = 300;
+const AUDIO_PIPELINE_STOP_LOG_INTERVAL_SECS: u64 = 5;
 
 fn log_audio_process_error(e: &anyhow::Error) {
     let now = SystemTime::now()
@@ -76,6 +77,64 @@ fn log_audio_process_error(e: &anyhow::Error) {
     } else {
         debug!("Error processing audio (rate-limited): {:?}", e);
     }
+}
+
+async fn await_recording_handle_stop(
+    device: &AudioDevice,
+    handle: Arc<Mutex<JoinHandle<Result<()>>>>,
+) {
+    let mut handle = handle.lock().await;
+    let start = std::time::Instant::now();
+    loop {
+        match tokio::time::timeout(
+            Duration::from_secs(AUDIO_PIPELINE_STOP_LOG_INTERVAL_SECS),
+            &mut *handle,
+        )
+        .await
+        {
+            Ok(Ok(Ok(()))) => {
+                debug!("recording handle for {} stopped cleanly", device);
+                return;
+            }
+            Ok(Ok(Err(e))) => {
+                debug!("recording handle for {} exited during stop: {}", device, e);
+                return;
+            }
+            Ok(Err(e)) if e.is_cancelled() => {
+                debug!("recording handle for {} was already cancelled", device);
+                return;
+            }
+            Ok(Err(e)) => {
+                warn!(
+                    "recording handle for {} failed while stopping: {}",
+                    device, e
+                );
+                return;
+            }
+            Err(_) => {
+                info!(
+                    "waiting for recording handle for {} to stop, elapsed={}s",
+                    device,
+                    start.elapsed().as_secs()
+                );
+            }
+        }
+    }
+}
+
+fn audio_pipeline_terminal_count(snapshot: &crate::metrics::AudioMetricsSnapshot) -> u64 {
+    snapshot.db_inserted
+        + snapshot.transcriptions_empty
+        + snapshot.transcription_errors
+        + snapshot.vad_rejected
+        + snapshot.process_errors
+        + snapshot.segments_deferred
+        + snapshot.db_duplicates_blocked
+}
+
+fn audio_pipeline_pending_count(snapshot: &crate::metrics::AudioMetricsSnapshot) -> u64 {
+    let expected = snapshot.chunks_sent.max(snapshot.chunks_received);
+    expected.saturating_sub(audio_pipeline_terminal_count(snapshot))
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -299,44 +358,171 @@ impl AudioManager {
 
         stop_device_monitor().await?;
 
-        // Stop producers FIRST: abort per-device recording tasks and the OS audio streams.
-        // This must happen before killing the consumer so any audio already queued in the
-        // crossbeam channel (including the final 30s flush) can still be drained.
-        for pair in self.recording_handles.iter() {
-            let handle = pair.value();
-            handle.lock().await.abort();
+        // Stop producers FIRST, but do it gracefully: each recording loop owns the
+        // final partial chunk and must be allowed to run its final flush before
+        // the central consumer is stopped. Capture the handle Arc up front so a
+        // concurrent cleanup path cannot make us lose the ability to await it.
+        let recordings: Vec<(AudioDevice, Arc<Mutex<JoinHandle<Result<()>>>>)> = self
+            .recording_handles
+            .iter()
+            .map(|pair| (pair.key().clone(), pair.value().clone()))
+            .collect();
+        for (device, _) in &recordings {
+            if let Err(e) = self.device_manager.stop_device(device).await {
+                let msg = e.to_string();
+                if !msg.contains("already stopped") && !msg.contains("not running") {
+                    warn!("failed to stop recording for {}: {}", device, e);
+                }
+            }
         }
-        self.recording_handles.clear();
+
+        for (device, handle) in recordings {
+            await_recording_handle_stop(&device, handle).await;
+            self.recording_handles.remove(&device);
+        }
+
+        // A recovery path may have inserted a handle just before the monitor was
+        // stopped. Sweep anything left so the receiver is not aborted while a
+        // producer still has a final partial chunk to enqueue.
+        let remaining_recordings: Vec<(AudioDevice, Arc<Mutex<JoinHandle<Result<()>>>>)> = self
+            .recording_handles
+            .iter()
+            .map(|pair| (pair.key().clone(), pair.value().clone()))
+            .collect();
+        for (device, handle) in remaining_recordings {
+            if let Err(e) = self.device_manager.stop_device(&device).await {
+                let msg = e.to_string();
+                if !msg.contains("already stopped") && !msg.contains("not running") {
+                    warn!("failed to stop remaining recording for {}: {}", device, e);
+                }
+            }
+            await_recording_handle_stop(&device, handle).await;
+            self.recording_handles.remove(&device);
+        }
+
         self.device_manager.stop_all_devices().await?;
 
-        // Drain the channel: wait until the pipeline handler has consumed all queued chunks
-        // (or a hard timeout expires). The early persist — file write + DB insert — happens
-        // at the very start of each chunk's processing, before any deferral decision.
-        // A 5s window is enough: the persist itself takes <100ms per chunk.
-        const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+        let output_path_prefix = {
+            let options = self.options.read().await;
+            options
+                .output_path
+                .as_ref()
+                .map(|path| path.to_string_lossy().into_owned())
+        };
+
+        // Drain the channel and wait until every dequeued chunk has completed
+        // its early persistence step. An empty channel alone is not enough: the
+        // consumer may have taken the final chunk but not yet made the
+        // audio_chunks row visible to reconciliation.
         const DRAIN_POLL: Duration = Duration::from_millis(100);
         let drain_start = std::time::Instant::now();
-        while drain_start.elapsed() < DRAIN_TIMEOUT {
-            if self.recording_receiver.is_empty() {
+        let mut last_drain_log = drain_start;
+        loop {
+            let snapshot = self.metrics.snapshot();
+            let receiver_empty = self.recording_receiver.is_empty();
+            let db_visible_chunks = if receiver_empty {
+                if let Some(prefix) = output_path_prefix.as_deref() {
+                    match self.db.count_audio_chunks_with_file_prefix(prefix).await {
+                        Ok(count) => Some(count as u64),
+                        Err(e) => {
+                            warn!("failed to count persisted audio chunks before stop: {}", e);
+                            None
+                        }
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            let db_has_expected_chunks =
+                db_visible_chunks.is_some_and(|count| count >= snapshot.chunks_sent);
+            if receiver_empty
+                && (snapshot.chunks_received >= snapshot.chunks_sent
+                    || audio_pipeline_pending_count(&snapshot) == 0
+                    || db_has_expected_chunks)
+            {
                 break;
+            }
+            if last_drain_log.elapsed()
+                >= Duration::from_secs(AUDIO_PIPELINE_STOP_LOG_INTERVAL_SECS)
+            {
+                info!(
+                    "waiting for audio queue to persist before shutdown: receiver_empty={}, elapsed={}s (sent={}, persisted_metric={}, persisted_db={:?})",
+                    receiver_empty,
+                    drain_start.elapsed().as_secs(),
+                    snapshot.chunks_sent,
+                    snapshot.chunks_received,
+                    db_visible_chunks
+                );
+                last_drain_log = std::time::Instant::now();
             }
             tokio::time::sleep(DRAIN_POLL).await;
         }
 
-        // Now it is safe to kill the consumer — any remaining chunks are already persisted
-        // to disk and the DB, so the background reconciliation sweep will transcribe them.
+        // Once producers have flushed and the recording channel is drained, stop
+        // the live consumers before shutdown reconciliation. The final chunk was
+        // previously allowed to be owned by both the realtime consumer and the
+        // shutdown reconciler; if the live path got stuck before writing its DB
+        // marker, stop waited forever for a terminal count that no owner would
+        // complete. Reconciliation is now the single shutdown owner for any DB
+        // chunk that still has no transcription row.
+        self.abort_central_audio_handlers().await;
+        self.reconcile_untranscribed_before_stop().await;
+
+        info!("audio manager stopped");
+        Ok(())
+    }
+
+    async fn abort_central_audio_handlers(&self) {
         let mut recording_receiver_handle = self.recording_receiver_handle.write().await;
         if let Some(handle) = recording_receiver_handle.take() {
             handle.abort();
         }
+        drop(recording_receiver_handle);
 
         let mut transcription_receiver_handle = self.transcription_receiver_handle.write().await;
         if let Some(handle) = transcription_receiver_handle.take() {
             handle.abort();
         }
+    }
 
-        info!("audio manager stopped");
-        Ok(())
+    async fn reconcile_untranscribed_before_stop(&self) {
+        let snapshot = self.metrics.snapshot();
+        let pending = audio_pipeline_pending_count(&snapshot);
+
+        let options = self.options.read().await;
+        let audio_engine = options.transcription_engine.clone();
+        let batch_max_duration_secs = options.batch_max_duration_secs;
+        let data_dir = options.output_path.clone();
+        drop(options);
+
+        let engine_guard = self.engine.read().await;
+        let Some(ref transcription_engine) = *engine_guard else {
+            return;
+        };
+
+        info!(
+            "shutdown audio reconciliation: checking DB for untranscribed rows (pipeline_pending={})",
+            pending
+        );
+        let count = super::reconciliation::reconcile_untranscribed(
+            &self.db,
+            transcription_engine,
+            self.on_transcription_insert.as_ref(),
+            audio_engine,
+            Some(self.segmentation_manager.clone()),
+            data_dir.as_deref(),
+            batch_max_duration_secs,
+            Some(self.metrics.clone()),
+        )
+        .await;
+        if count > 0 {
+            info!(
+                "shutdown audio reconciliation: completed {} untranscribed chunk(s)",
+                count
+            );
+        }
     }
 
     pub async fn stop(&self) -> Result<()> {
@@ -372,13 +558,10 @@ impl AudioManager {
     /// Idempotent — safe to call on already-stopped devices.
     /// Used by device monitor for force-cycling devices after sleep/wake.
     pub async fn stop_device_recording(&self, device: &AudioDevice) -> Result<()> {
-        // Signal the recording loop to stop BEFORE aborting the handle,
-        // so it exits cleanly without triggering "stream dead" warnings.
-        if let Some(is_running) = self.device_manager.is_running_mut(device) {
-            is_running.store(false, std::sync::atomic::Ordering::Relaxed);
-        }
-
-        // Ignore "already stopped" errors
+        // `stop_device` signals `is_running=false` and tears down the OS stream.
+        // The recording task observes that stop request, sends its final partial
+        // chunk to the central audio queue, then exits. Only abort if that graceful
+        // path misses its timeout.
         if let Err(e) = self.device_manager.stop_device(device).await {
             let msg = e.to_string();
             if !msg.contains("already stopped") && !msg.contains("not running") {
@@ -386,12 +569,9 @@ impl AudioManager {
             }
         }
 
-        if let Some(pair) = self.recording_handles.get(device) {
-            let handle = pair.value();
-            handle.lock().await.abort();
+        if let Some((_, handle)) = self.recording_handles.remove(device) {
+            await_recording_handle_stop(device, handle).await;
         }
-
-        self.recording_handles.remove(device);
 
         Ok(())
     }
@@ -475,6 +655,10 @@ impl AudioManager {
             return Ok(());
         }
 
+        if device.device_type == DeviceType::Output && self.disable_system_audio().await {
+            return Ok(());
+        }
+
         if let Err(e) = self.device_manager.start_device(device).await {
             let err_str = e.to_string();
 
@@ -514,6 +698,10 @@ impl AudioManager {
         self.options.read().await.use_system_default_audio
     }
 
+    pub async fn disable_system_audio(&self) -> bool {
+        self.options.read().await.disable_system_audio
+    }
+
     async fn record_device(&self, device: &AudioDevice) -> Result<JoinHandle<Result<()>>> {
         let options = self.options.read().await;
         let stream = self.device_manager.stream(device).unwrap();
@@ -539,8 +727,18 @@ impl AudioManager {
                 return Err(anyhow!("record_device failed: {}", e));
             }
 
-            // Check for inner Result errors (record_and_transcribe returned Err)
+            // Check for inner Result errors (record_and_transcribe returned Err).
+            // A graceful stop may still surface as Err because the underlying
+            // stream marks itself disconnected while being torn down; if the
+            // stop flag is already false, the final flush has already run.
             if let Ok(Err(ref e)) = record_result {
+                if !is_running.load(Ordering::Relaxed) {
+                    info!(
+                        "recording for device {} stopped after graceful final flush: {}",
+                        device_clone, e
+                    );
+                    return Ok(());
+                }
                 warn!(
                     "recording for device {} exited with error: {}",
                     device_clone, e
@@ -548,11 +746,15 @@ impl AudioManager {
                 return Err(anyhow!("record_device {} failed: {}", device_clone, e));
             }
 
+            if !is_running.load(Ordering::Relaxed) {
+                info!("recording for device {} stopped cleanly", device_clone);
+                return Ok(());
+            }
+
             warn!(
                 "recording handle for device {} exited unexpectedly with Ok",
                 device_clone
             );
-
             Err(anyhow!(
                 "recording handle for device {} exited unexpectedly",
                 device_clone
@@ -593,6 +795,7 @@ impl AudioManager {
         let db = self.db.clone();
         let shared_engine = self.engine.clone();
         let on_insert_session = self.on_transcription_insert.clone();
+        let status = self.status.clone();
 
         // Build unified transcription engine — only loads the needed model
         let engine = TranscriptionEngine::new(
@@ -634,7 +837,6 @@ impl AudioManager {
             let mut deferral_started: Option<std::time::Instant> = None;
 
             while let Ok(audio) = whisper_receiver.recv() {
-                metrics.record_chunk_received();
                 debug!("received audio from device: {:?}", audio.device.name);
 
                 // Audio-based call detection: update meeting detector with speech activity.
@@ -725,6 +927,18 @@ impl AudioManager {
                 } else {
                     None
                 };
+                metrics.record_chunk_received();
+
+                if audio.device.device_type == crate::core::device::DeviceType::Output
+                    && *status.read().await == AudioManagerStatus::Stopped
+                {
+                    metrics.record_vad_result(false, 0.0);
+                    info!(
+                        "stop drain: persisted output audio chunk for {}, skipping realtime transcription",
+                        audio.device
+                    );
+                    continue;
+                }
 
                 // Batch mode: defer transcription during audio sessions (meetings, YouTube, etc).
                 // Audio is already persisted to disk + DB above.
@@ -879,7 +1093,6 @@ impl AudioManager {
             handle.abort();
         }
 
-        let rec = self.recording_handles.clone();
         let recording = self.recording_receiver_handle.clone();
         let transcript = self.transcription_receiver_handle.clone();
 
@@ -889,8 +1102,14 @@ impl AudioManager {
         if let Some(handle) = transcript.write().await.take() {
             handle.abort();
         }
-        for h in rec.iter() {
-            h.value().lock().await.abort();
+        let remaining_recordings: Vec<(AudioDevice, Arc<Mutex<JoinHandle<Result<()>>>>)> = self
+            .recording_handles
+            .iter()
+            .map(|pair| (pair.key().clone(), pair.value().clone()))
+            .collect();
+        for (device, handle) in remaining_recordings {
+            await_recording_handle_stop(&device, handle).await;
+            self.recording_handles.remove(&device);
         }
 
         let _ = stop_device_monitor().await;
@@ -932,16 +1151,9 @@ impl AudioManager {
         );
 
         for device in &output_devices {
-            // Stop the underlying stream
-            if let Err(e) = self.device_manager.stop_device(device).await {
+            if let Err(e) = self.stop_device_recording(device).await {
                 warn!("DRM: failed to stop audio device {}: {:?}", device, e);
             }
-
-            // Abort the recording task
-            if let Some(pair) = self.recording_handles.get(device) {
-                pair.value().lock().await.abort();
-            }
-            self.recording_handles.remove(device);
         }
 
         // Store stopped devices for later restart
@@ -1407,6 +1619,46 @@ impl Drop for AudioManager {
 mod tests {
     use super::*;
     use crate::core::device::{AudioDevice, DeviceType};
+    use crate::metrics::AudioMetricsSnapshot;
+
+    fn audio_metrics_snapshot_for_test(
+        chunks_sent: u64,
+        chunks_received: u64,
+        db_inserted: u64,
+        transcriptions_empty: u64,
+        transcription_errors: u64,
+        vad_rejected: u64,
+        process_errors: u64,
+        segments_deferred: u64,
+    ) -> AudioMetricsSnapshot {
+        AudioMetricsSnapshot {
+            uptime_secs: 1.0,
+            chunks_sent,
+            chunks_channel_full: 0,
+            stream_timeouts: 0,
+            chunks_received,
+            process_errors,
+            vad_passed: 0,
+            vad_rejected,
+            avg_speech_ratio: 0.0,
+            transcriptions_completed: db_inserted,
+            transcriptions_empty,
+            transcription_errors,
+            db_inserted,
+            db_duplicates_blocked: 0,
+            db_overlaps_trimmed: 0,
+            total_words: 0,
+            segments_deferred,
+            segments_batch_processed: 0,
+            batch_pause_events: 0,
+            batch_resume_events: 0,
+            vad_passthrough_rate: 0.0,
+            words_per_minute: 0.0,
+            audio_level_rms: 0.0,
+            last_db_write_ts: 0,
+            last_transcription_attempt_ts: 0,
+        }
+    }
 
     #[test]
     fn test_central_handler_restart_result_defaults() {
@@ -1415,6 +1667,25 @@ mod tests {
         assert!(!result.transcription_restarted);
         assert!(result.recording_error.is_none());
         assert!(result.transcription_error.is_none());
+    }
+
+    #[test]
+    fn audio_pipeline_pending_count_waits_for_unfinished_received_chunks() {
+        let snapshot = audio_metrics_snapshot_for_test(4, 4, 3, 0, 0, 0, 0, 0);
+        assert_eq!(audio_pipeline_pending_count(&snapshot), 1);
+    }
+
+    #[test]
+    fn audio_pipeline_pending_count_waits_for_sent_but_not_received_chunks() {
+        let snapshot = audio_metrics_snapshot_for_test(4, 3, 3, 0, 0, 0, 0, 0);
+        assert_eq!(audio_pipeline_pending_count(&snapshot), 1);
+    }
+
+    #[test]
+    fn audio_pipeline_pending_count_treats_all_terminal_outcomes_as_done() {
+        let snapshot = audio_metrics_snapshot_for_test(7, 7, 2, 1, 1, 1, 1, 1);
+        assert_eq!(audio_pipeline_terminal_count(&snapshot), 7);
+        assert_eq!(audio_pipeline_pending_count(&snapshot), 0);
     }
 
     // ── DRM stopped devices tracking tests ─────────────────────

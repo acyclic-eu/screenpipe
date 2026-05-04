@@ -23,7 +23,7 @@ use screenpipe_core::Language;
 use std::path::PathBuf;
 use std::{sync::Arc, sync::Mutex as StdMutex};
 use tokio::sync::Mutex;
-use tracing::error;
+use tracing::{debug, error};
 use whisper_rs::WhisperState;
 
 use crate::{AudioInput, TranscriptionResult};
@@ -293,24 +293,6 @@ pub async fn process_audio_input(
     };
 
     let is_output_device = audio.device.device_type == crate::core::device::DeviceType::Output;
-    let (mut segments, speech_ratio_ok, speech_ratio) = prepare_segments(
-        &audio_data,
-        vad_engine,
-        segmentation_model_path.as_ref(),
-        embedding_manager,
-        embedding_extractor,
-        &audio.device.to_string(),
-        is_output_device,
-        filter_music,
-    )
-    .await?;
-
-    metrics.record_vad_result(speech_ratio_ok, speech_ratio);
-
-    if !speech_ratio_ok {
-        // Audio is already persisted to disk by the caller — just skip transcription
-        return Ok(());
-    }
 
     // Use the pre-written path if audio was already persisted before deferral,
     // otherwise write now (fallback for callers that don't pre-persist)
@@ -330,6 +312,80 @@ pub async fn process_audio_input(
         }
         new_file_path
     };
+
+    if !is_output_device {
+        // Input/microphone chunks must bypass VAD + diarization entirely. Running
+        // prepare_segments() first can drop real speech and can also block the
+        // final stop drain before this full-chunk STT path ever runs.
+        metrics.record_vad_result(true, 1.0);
+        let duration_secs = audio_data.len() as f64 / SAMPLE_RATE as f64;
+        let rms = if audio_data.is_empty() {
+            0.0
+        } else {
+            (audio_data.iter().map(|sample| sample * sample).sum::<f32>() / audio_data.len() as f32)
+                .sqrt()
+        };
+        debug!(
+            "input audio chunk STT start: device={}, path={}, duration={:.3}s, rms={:.6}",
+            audio.device, file_path, duration_secs, rms
+        );
+        let full_chunk = SpeechSegment {
+            start: 0.0,
+            end: duration_secs,
+            samples: audio_data,
+            speaker: "unknown".to_string(),
+            embedding: Vec::new(),
+            sample_rate: SAMPLE_RATE,
+        };
+        let stt_start = std::time::Instant::now();
+        let transcription_result = run_stt(
+            full_chunk,
+            audio.device.clone(),
+            file_path,
+            timestamp,
+            session,
+        )
+        .await?;
+        debug!(
+            "input audio chunk STT done: device={}, path={}, elapsed_ms={}, chars={}, error={}",
+            audio.device,
+            transcription_result.path,
+            stt_start.elapsed().as_millis(),
+            transcription_result
+                .transcription
+                .as_ref()
+                .map(|text| text.chars().count())
+                .unwrap_or(0),
+            transcription_result.error.is_some()
+        );
+
+        let send_path = transcription_result.path.clone();
+        debug!("input audio chunk send start: path={}", send_path);
+        if output_sender.send(transcription_result).is_err() {
+            return Ok(());
+        }
+        debug!("input audio chunk send done: path={}", send_path);
+        return Ok(());
+    }
+
+    let (mut segments, speech_ratio_ok, speech_ratio) = prepare_segments(
+        &audio_data,
+        vad_engine,
+        segmentation_model_path.as_ref(),
+        embedding_manager,
+        embedding_extractor,
+        &audio.device.to_string(),
+        is_output_device,
+        filter_music,
+    )
+    .await?;
+
+    metrics.record_vad_result(speech_ratio_ok, speech_ratio);
+
+    if !speech_ratio_ok {
+        // Audio is already persisted to disk by the caller — just skip transcription
+        return Ok(());
+    }
 
     while let Some(segment) = segments.recv().await {
         let path = file_path.clone();

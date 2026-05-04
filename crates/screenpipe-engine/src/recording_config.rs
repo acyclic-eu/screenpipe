@@ -40,6 +40,7 @@ pub struct RecordingConfig {
     // Devices & monitors
     pub audio_devices: Vec<String>,
     pub use_system_default_audio: bool,
+    pub disable_system_audio: bool,
     /// Experimental: use CoreAudio Process Tap for System Audio on macOS 14.4+.
     pub experimental_coreaudio_system_audio: bool,
     pub monitor_ids: Vec<String>,
@@ -170,6 +171,7 @@ impl RecordingConfig {
             },
             audio_devices: settings.audio_devices.clone(),
             use_system_default_audio: settings.use_system_default_audio,
+            disable_system_audio: settings.disable_system_audio,
             experimental_coreaudio_system_audio: settings.experimental_coreaudio_system_audio,
             monitor_ids: settings.monitor_ids.clone(),
             use_all_monitors: settings.use_all_monitors,
@@ -267,6 +269,7 @@ impl RecordingConfig {
             .transcription_engine(self.audio_transcription_engine.clone())
             .enabled_devices(audio_devices)
             .use_system_default_audio(self.use_system_default_audio)
+            .disable_system_audio(self.disable_system_audio)
             .experimental_coreaudio_system_audio(self.experimental_coreaudio_system_audio)
             .deepgram_api_key(self.deepgram_api_key.clone())
             .output_path(output_path)

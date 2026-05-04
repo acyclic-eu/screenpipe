@@ -70,6 +70,10 @@ pub struct RecordingSettings {
     #[serde(rename = "useSystemDefaultAudio")]
     pub use_system_default_audio: bool,
 
+    /// Disable system/output audio capture while keeping input/microphone audio enabled.
+    #[serde(rename = "disableSystemAudio")]
+    pub disable_system_audio: bool,
+
     /// Experimental: capture System Audio via the CoreAudio Process Tap API
     /// (macOS 14.4+) instead of ScreenCaptureKit. Avoids SCK's display
     /// enumeration failures after sleep/wake, the GPU/compositor wake
@@ -330,6 +334,7 @@ impl Default for RecordingSettings {
             transcription_mode: "batch".to_string(),
             audio_devices: vec![],
             use_system_default_audio: true,
+            disable_system_audio: false,
             experimental_coreaudio_system_audio: false,
             audio_chunk_duration: 30,
             deepgram_api_key: String::new(),

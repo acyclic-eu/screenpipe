@@ -47,6 +47,12 @@ const AUDIO_RECEIVE_TIMEOUT_SECS: u64 = 8;
 /// ScreenCaptureKit may take a moment to begin delivering callbacks.
 const STREAM_STARTUP_GRACE_SECS: u64 = 10;
 
+/// Poll interval used to wake the recording loop after a graceful stop request.
+/// Without this, shutdown can sit inside `receiver.recv()` until the audio
+/// timeout fires; callers often abort the task before the final partial chunk
+/// reaches `flush_audio`.
+const STOP_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
 /// Recording always uses 30s segments. Both batch and realtime modes record identically.
 /// The batch vs realtime distinction is in the processing layer (manager.rs):
 /// - Realtime: transcribe immediately after each segment
@@ -82,6 +88,7 @@ pub async fn run_record_and_transcribe(
     let mut segment_start_time = now_epoch_secs();
     let stream_start = std::time::Instant::now();
     let mut segment_count: u64 = 0;
+    let mut has_unflushed_audio = false;
 
     let mut was_paused_for_lock = false;
 
@@ -148,17 +155,34 @@ pub async fn run_record_and_transcribe(
                 &device_name,
                 &metrics,
                 &stream_start,
+                &is_running,
             )
             .await?
             {
-                Some(chunk) => {
-                    // Route through the source buffer so Bluetooth packet-drop gaps
-                    // are converted to silence instead of crackle.
-                    source_buffer.push(chunk);
-                    collected_audio.extend(source_buffer.drain_all());
-                }
+                Some(chunk) => append_audio_chunk_to_collector(
+                    &mut source_buffer,
+                    &mut collected_audio,
+                    chunk,
+                    &mut has_unflushed_audio,
+                ),
                 None => continue,
             }
+        }
+
+        if !is_running.load(Ordering::Relaxed)
+            || audio_stream.is_disconnected.load(Ordering::Relaxed)
+        {
+            drain_ready_audio_on_stop(
+                &mut receiver,
+                &mut source_buffer,
+                &mut collected_audio,
+                &mut has_unflushed_audio,
+                &device_name,
+            );
+        }
+
+        if collected_audio.len() < max_samples {
+            break;
         }
 
         segment_count += 1;
@@ -177,22 +201,32 @@ pub async fn run_record_and_transcribe(
             &metrics,
         )
         .await?;
+        has_unflushed_audio = false;
         segment_start_time = now_epoch_secs();
     }
 
     // Flush remaining audio on exit
-    if let Err(e) = flush_audio(
-        &mut collected_audio,
-        0,
-        segment_start_time,
-        &audio_stream,
-        &whisper_sender,
-        &device_name,
-        &metrics,
-    )
-    .await
-    {
-        warn!("final flush failed for {}: {}", device_name, e);
+    if has_unflushed_audio {
+        info!(
+            "final flush for {}: {:.2}s of audio",
+            device_name,
+            collected_audio.len() as f64 / sample_rate as f64
+        );
+        if let Err(e) = flush_audio(
+            &mut collected_audio,
+            0,
+            segment_start_time,
+            &audio_stream,
+            &whisper_sender,
+            &device_name,
+            &metrics,
+        )
+        .await
+        {
+            warn!("final flush failed for {}: {}", device_name, e);
+        }
+    } else {
+        debug!("no final flush needed for {}", device_name);
     }
 
     if audio_stream.is_disconnected.load(Ordering::Relaxed) {
@@ -201,6 +235,60 @@ pub async fn run_record_and_transcribe(
     } else {
         info!("stopped recording for {}", device_name);
         Ok(())
+    }
+}
+
+fn append_audio_chunk_to_collector(
+    source_buffer: &mut SourceBuffer,
+    collected_audio: &mut Vec<f32>,
+    chunk: Vec<f32>,
+    has_unflushed_audio: &mut bool,
+) {
+    // Route through the source buffer so Bluetooth packet-drop gaps are converted
+    // to silence instead of crackle.
+    source_buffer.push(chunk);
+    let drained = source_buffer.drain_all();
+    if !drained.is_empty() {
+        *has_unflushed_audio = true;
+        collected_audio.extend(drained);
+    }
+}
+
+fn drain_ready_audio_on_stop(
+    receiver: &mut broadcast::Receiver<Vec<f32>>,
+    source_buffer: &mut SourceBuffer,
+    collected_audio: &mut Vec<f32>,
+    has_unflushed_audio: &mut bool,
+    device_name: &str,
+) {
+    let mut drained_chunks = 0_u64;
+    loop {
+        match receiver.try_recv() {
+            Ok(chunk) => {
+                drained_chunks += 1;
+                append_audio_chunk_to_collector(
+                    source_buffer,
+                    collected_audio,
+                    chunk,
+                    has_unflushed_audio,
+                );
+            }
+            Err(broadcast::error::TryRecvError::Lagged(n)) => {
+                warn!(
+                    "audio channel lagged by {} messages for {} while draining stop queue",
+                    n, device_name
+                );
+            }
+            Err(broadcast::error::TryRecvError::Empty)
+            | Err(broadcast::error::TryRecvError::Closed) => break,
+        }
+    }
+
+    if drained_chunks > 0 {
+        info!(
+            "drained {} queued audio chunk(s) for {} during stop",
+            drained_chunks, device_name
+        );
     }
 }
 
@@ -213,12 +301,17 @@ async fn recv_audio_chunk(
     device_name: &str,
     metrics: &Arc<AudioPipelineMetrics>,
     stream_start: &std::time::Instant,
+    is_running: &Arc<AtomicBool>,
 ) -> Result<Option<Vec<f32>>> {
-    let recv_result = tokio::time::timeout(
-        Duration::from_secs(AUDIO_RECEIVE_TIMEOUT_SECS),
-        receiver.recv(),
-    )
-    .await;
+    let recv_result = tokio::select! {
+        _ = wait_for_stop_request(is_running, &audio_stream.is_disconnected) => {
+            return Ok(None);
+        }
+        result = tokio::time::timeout(
+            Duration::from_secs(AUDIO_RECEIVE_TIMEOUT_SECS),
+            receiver.recv(),
+        ) => result,
+    };
 
     match recv_result {
         Ok(Ok(chunk)) => {
@@ -294,6 +387,12 @@ fn now_epoch_secs() -> u64 {
         .as_secs()
 }
 
+async fn wait_for_stop_request(is_running: &Arc<AtomicBool>, is_disconnected: &Arc<AtomicBool>) {
+    while is_running.load(Ordering::Relaxed) && !is_disconnected.load(Ordering::Relaxed) {
+        tokio::time::sleep(STOP_POLL_INTERVAL).await;
+    }
+}
+
 /// Send the collected audio to the Whisper channel and keep the overlap tail.
 /// Clears `collected_audio` down to the overlap on success.
 async fn flush_audio(
@@ -349,4 +448,130 @@ async fn flush_audio(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::{
+        device::{AudioDevice, DeviceType},
+        stream::AudioStream,
+    };
+    use crate::metrics::AudioPipelineMetrics;
+
+    #[tokio::test]
+    async fn final_flush_sends_partial_chunk_when_stop_requested() {
+        let sample_rate = 16_000_u32;
+        let fake_device = Arc::new(AudioDevice::new(
+            "Test Microphone".to_string(),
+            DeviceType::Input,
+        ));
+        let (audio_stream, tx) = AudioStream::from_sender_for_test(fake_device, sample_rate, 1);
+        let audio_stream = Arc::new(audio_stream);
+        let (whisper_tx, whisper_rx) = crossbeam::channel::bounded::<AudioInput>(4);
+        let is_running = Arc::new(AtomicBool::new(true));
+
+        let handle = tokio::spawn(run_record_and_transcribe(
+            audio_stream,
+            Duration::from_secs(30),
+            Arc::new(whisper_tx),
+            is_running.clone(),
+            Arc::new(AudioPipelineMetrics::new()),
+        ));
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        tx.send(vec![0.25_f32; sample_rate as usize])
+            .expect("test audio receiver should be active");
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        is_running.store(false, Ordering::Relaxed);
+
+        tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("recording task should wake promptly on stop")
+            .expect("recording task should not panic")
+            .expect("graceful stop should return Ok");
+
+        let audio = whisper_rx
+            .try_recv()
+            .expect("final partial chunk should be flushed");
+        assert_eq!(audio.sample_rate, sample_rate);
+        assert_eq!(audio.data.len(), sample_rate as usize);
+        assert!(whisper_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn final_flush_does_not_resend_overlap_when_no_new_audio_arrived() {
+        let sample_rate = 16_000_u32;
+        let fake_device = Arc::new(AudioDevice::new(
+            "Test Microphone".to_string(),
+            DeviceType::Input,
+        ));
+        let (audio_stream, tx) = AudioStream::from_sender_for_test(fake_device, sample_rate, 1);
+        let audio_stream = Arc::new(audio_stream);
+        let (whisper_tx, whisper_rx) = crossbeam::channel::bounded::<AudioInput>(4);
+        let is_running = Arc::new(AtomicBool::new(true));
+
+        let handle = tokio::spawn(run_record_and_transcribe(
+            audio_stream,
+            Duration::from_secs(1),
+            Arc::new(whisper_tx),
+            is_running.clone(),
+            Arc::new(AudioPipelineMetrics::new()),
+        ));
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        tx.send(vec![0.25_f32; (sample_rate as usize) * 3])
+            .expect("test audio receiver should be active");
+
+        let first = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Ok(audio) = whisper_rx.try_recv() {
+                    return audio;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("full chunk should flush before stop");
+        assert_eq!(first.data.len(), sample_rate as usize);
+
+        is_running.store(false, Ordering::Relaxed);
+        tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("recording task should wake promptly on stop")
+            .expect("recording task should not panic")
+            .expect("graceful stop should return Ok");
+
+        assert!(whisper_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn stop_drain_collects_queued_audio_before_final_flush() {
+        let sample_rate = 16_000_u32;
+        let (tx, mut rx) = broadcast::channel::<Vec<f32>>(8);
+        let mut source_buffer = SourceBuffer::new("Test Microphone", sample_rate);
+        let mut collected_audio = Vec::new();
+        let mut has_unflushed_audio = false;
+
+        tx.send(vec![0.25_f32; sample_rate as usize / 2])
+            .expect("receiver should be active");
+        tx.send(vec![0.25_f32; sample_rate as usize / 2])
+            .expect("receiver should be active");
+
+        drain_ready_audio_on_stop(
+            &mut rx,
+            &mut source_buffer,
+            &mut collected_audio,
+            &mut has_unflushed_audio,
+            "Test Microphone",
+        );
+
+        assert!(has_unflushed_audio);
+        assert_eq!(collected_audio.len(), sample_rate as usize);
+        assert!(matches!(
+            rx.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+    }
 }

@@ -673,19 +673,36 @@ async fn execute_single_write(
                 return Ok(WriteResult::Id(id));
             }
 
-            // If transcription is empty, just ensure chunk exists
+            // Empty transcriptions are still terminal markers: the audio was captured
+            // and checked, but the STT engine found no speech worth indexing.
             if transcription.trim().is_empty() {
-                if *existing_chunk_id != 0 {
-                    return Ok(WriteResult::Id(*existing_chunk_id));
-                }
-                let id =
+                let audio_chunk_id = if *existing_chunk_id != 0 {
+                    *existing_chunk_id
+                } else {
                     sqlx::query("INSERT INTO audio_chunks (file_path, timestamp) VALUES (?1, ?2)")
                         .bind(file_path.as_str())
                         .bind(ts)
                         .execute(&mut **conn)
                         .await?
-                        .last_insert_rowid();
-                return Ok(WriteResult::Id(id));
+                        .last_insert_rowid()
+                };
+
+                sqlx::query(
+                    "INSERT OR IGNORE INTO audio_transcriptions (audio_chunk_id, transcription, offset_index, timestamp, transcription_engine, device, is_input_device, speaker_id, start_time, end_time, text_length) VALUES (?1, '', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0)",
+                )
+                .bind(audio_chunk_id)
+                .bind(offset_index)
+                .bind(ts)
+                .bind(transcription_engine.as_str())
+                .bind(device_name.as_str())
+                .bind(is_input_device)
+                .bind(speaker_id)
+                .bind(start_time)
+                .bind(end_time)
+                .execute(&mut **conn)
+                .await?;
+
+                return Ok(WriteResult::Id(audio_chunk_id));
             }
 
             // Insert chunk if needed

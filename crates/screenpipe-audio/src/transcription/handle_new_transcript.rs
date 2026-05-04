@@ -54,19 +54,25 @@ pub async fn handle_new_transcript(
         // VAD filters everything. The health check uses this to distinguish
         // "silence, nothing to write" from "pipeline stalled, writes blocked".
         metrics.record_transcription_attempt();
+        debug!(
+            "transcription consumer received result: path={}, chars={}, error={}",
+            transcription.path,
+            transcription
+                .transcription
+                .as_ref()
+                .map(|text| text.chars().count())
+                .unwrap_or(0),
+            transcription.error.is_some()
+        );
 
-        if transcription
+        let is_empty_transcription = transcription
             .transcription
-            .clone()
-            .is_some_and(|t| t.is_empty())
-        {
-            metrics.record_transcription_empty();
-            continue;
-        }
+            .as_deref()
+            .is_some_and(|text| text.is_empty());
 
         if transcription.error.is_some() {
             metrics.record_transcription_error();
-        } else {
+        } else if !is_empty_transcription {
             metrics.record_transcription_completed();
         }
 
@@ -90,30 +96,34 @@ pub async fn handle_new_transcript(
         let mut current_transcript: Option<String> = transcription.transcription.clone();
         let mut processed_previous: Option<String> = None;
         let mut was_trimmed = false;
+        let is_input_device =
+            transcription.input.device.device_type == crate::core::device::DeviceType::Input;
 
-        if let Some((previous, current)) =
-            transcription.cleanup_overlap(previous_transcript.clone())
-        {
-            // If current is empty after cleanup, the entire transcript was a duplicate - skip it
-            if current.is_empty() {
-                metrics.record_duplicate_blocked();
-                info!(
+        if !is_input_device {
+            if let Some((previous, current)) =
+                transcription.cleanup_overlap(previous_transcript.clone())
+            {
+                // If current is empty after cleanup, the entire transcript was a duplicate - skip it
+                if current.is_empty() {
+                    metrics.record_duplicate_blocked();
+                    info!(
                     "device {} skipping duplicate transcript (entire content overlaps with previous)",
                     transcription.input.device
                 );
-                continue;
-            }
+                    continue;
+                }
 
-            // Update previous transcript if it was trimmed
-            if !previous.is_empty() && previous != previous_transcript {
-                processed_previous = Some(previous);
-            }
+                // Update previous transcript if it was trimmed
+                if !previous.is_empty() && previous != previous_transcript {
+                    processed_previous = Some(previous);
+                }
 
-            // Use the cleaned current transcript (with overlap removed)
-            if current != current_transcript.clone().unwrap_or_default() {
-                current_transcript = Some(current);
-                was_trimmed = true;
-                metrics.record_overlap_trimmed();
+                // Use the cleaned current transcript (with overlap removed)
+                if current != current_transcript.clone().unwrap_or_default() {
+                    current_transcript = Some(current);
+                    was_trimmed = true;
+                    metrics.record_overlap_trimmed();
+                }
             }
         }
 
@@ -132,14 +142,14 @@ pub async fn handle_new_transcript(
 
         // Save fields before moving transcription into process_transcription_result
         let device_name = transcription.input.device.to_string();
-        let is_input =
-            transcription.input.device.device_type == crate::core::device::DeviceType::Input;
         let audio_file_path = transcription.path.clone();
         let start_time = Some(transcription.start_time);
         let end_time = Some(transcription.end_time);
         let duration_secs = transcription.end_time - transcription.start_time;
         let insert_transcription = current_transcript.clone().unwrap_or_default();
         let capture_timestamp = transcription.input.capture_timestamp;
+        let process_start = std::time::Instant::now();
+        let process_path = transcription.path.clone();
 
         // Process the transcription result
         match process_transcription_result(
@@ -154,6 +164,12 @@ pub async fn handle_new_transcript(
         {
             Err(e) => error!("Error processing audio result: {}", e),
             Ok(result) => {
+                debug!(
+                    "transcription consumer DB processing done: path={}, elapsed_ms={}, inserted={}",
+                    process_path,
+                    process_start.elapsed().as_millis(),
+                    result.is_some()
+                );
                 if let Some(ref result) = result {
                     prev_id_by_device.insert(device_key.clone(), result.audio_chunk_id);
                 } else {
@@ -170,11 +186,15 @@ pub async fn handle_new_transcript(
 
                 // Notify the hot frame cache (or other listeners)
                 if let (Some(ref callback), Some(ref result)) = (&on_insert, &result) {
+                    debug!(
+                        "transcription consumer callback start: path={}",
+                        audio_file_path
+                    );
                     callback(AudioInsertInfo {
                         audio_chunk_id: result.audio_chunk_id,
                         transcription: insert_transcription.clone(),
                         device_name: device_name.clone(),
-                        is_input,
+                        is_input: is_input_device,
                         audio_file_path: audio_file_path.clone(),
                         duration_secs,
                         start_time,
@@ -182,6 +202,10 @@ pub async fn handle_new_transcript(
                         speaker_id: result.speaker_id,
                         capture_timestamp,
                     });
+                    debug!(
+                        "transcription consumer callback done: path={}",
+                        audio_file_path
+                    );
                 }
             }
         }

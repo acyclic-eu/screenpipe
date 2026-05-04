@@ -311,6 +311,9 @@ pub async fn reconcile_untranscribed(
                 } else {
                     consecutive_db_errors = 0;
                     success_count += 1;
+                    if let Some(m) = &metrics {
+                        m.record_db_insert(0);
+                    }
                 }
             }
 
@@ -479,15 +482,6 @@ async fn finalize_batch(
     .await
     .map_err(|e| e.to_string())?;
 
-    // Record the DB write so health-check doesn't flag a false "stalled" alarm.
-    // Without this, sessions where reconciliation does most of the writes (batch
-    // mode, retry path) leave `last_db_write_ts` stale and the health endpoint
-    // reports "audio DB writes stalled — restart recommended" to a healthy system.
-    if let Some(m) = metrics {
-        let word_count = pending.transcription.split_whitespace().count() as u64;
-        m.record_db_insert(word_count);
-    }
-
     // Success — remove the pending file
     if let Some(dir) = data_dir {
         remove_pending(dir, pending.audio_chunk_id);
@@ -528,6 +522,17 @@ async fn finalize_batch(
             let _ = std::fs::remove_file(path);
         }
         count += pending.secondary_chunk_ids.len();
+    }
+
+    // Record every source chunk as terminal for shutdown drain accounting.
+    // The merged batch writes one transcription row, but it represents the
+    // primary chunk plus any secondary chunks deleted above.
+    if let Some(m) = metrics {
+        let word_count = pending.transcription.split_whitespace().count() as u64;
+        m.record_db_insert(word_count);
+        for _ in 1..count {
+            m.record_db_insert(0);
+        }
     }
 
     Ok(count)

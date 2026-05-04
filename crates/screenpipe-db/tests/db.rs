@@ -171,6 +171,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_search_audio_keeps_same_chunk_same_offset_rows() {
+        let db = setup_test_db().await;
+        let audio_chunk_id = db
+            .insert_audio_chunk("same_chunk_audio.mp4", None)
+            .await
+            .unwrap();
+        let device = AudioDevice {
+            name: "test mic".to_string(),
+            device_type: DeviceType::Input,
+        };
+
+        db.insert_audio_transcription(
+            audio_chunk_id,
+            "these codes.",
+            0,
+            "WhisperTiny",
+            &device,
+            None,
+            Some(27.399),
+            Some(28.614),
+            None,
+        )
+        .await
+        .unwrap();
+        db.insert_audio_transcription(
+            audio_chunk_id,
+            "Put",
+            0,
+            "WhisperTiny",
+            &device,
+            None,
+            Some(29.222),
+            Some(29.863),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let results = db
+            .search_audio("", 100, 0, None, None, None, None, None, None, None, None)
+            .await
+            .unwrap();
+        let transcriptions: Vec<String> = results
+            .into_iter()
+            .map(|result| result.transcription)
+            .collect();
+
+        assert_eq!(transcriptions.len(), 2);
+        assert!(transcriptions.contains(&"these codes.".to_string()));
+        assert!(transcriptions.contains(&"Put".to_string()));
+    }
+
+    #[tokio::test]
     async fn test_update_and_search_audio() {
         let db = setup_test_db().await;
         let audio_chunk_id = db.insert_audio_chunk("test_audio.mp4", None).await.unwrap();

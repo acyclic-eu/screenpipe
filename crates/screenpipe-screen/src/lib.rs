@@ -18,7 +18,7 @@ pub mod ocr_cache;
 pub mod tesseract;
 pub mod utils;
 #[cfg(target_os = "macos")]
-pub use apple::perform_ocr_apple;
+pub use apple::{default_ocr_languages, get_apple_languages, perform_ocr_apple};
 pub use core::RealtimeVisionEvent;
 pub use metrics::{MetricsSnapshot, PipelineMetrics};
 pub use utils::OcrEngine;

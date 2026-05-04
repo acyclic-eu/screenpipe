@@ -11,7 +11,7 @@ use screenpipe_db::DatabaseManager;
 
 use crate::{
     core::{
-        device::{default_input_device, default_output_device},
+        device::{default_input_device, default_output_device, parse_audio_device, DeviceType},
         engine::AudioTranscriptionEngine,
     },
     meeting_detector::MeetingDetector,
@@ -59,6 +59,8 @@ pub struct AudioManagerOptions {
     /// When true, automatically follow system default audio devices
     /// and switch when the system default changes (e.g., device plug/unplug)
     pub use_system_default_audio: bool,
+    /// Disable system/output audio capture while keeping input/microphone audio enabled.
+    pub disable_system_audio: bool,
     /// Experimental: use CoreAudio Process Tap for System Audio (macOS 14.4+).
     /// When false (default), System Audio uses ScreenCaptureKit as before.
     /// Has no effect on non-macOS or macOS <14.4 — falls back to SCK.
@@ -102,6 +104,7 @@ impl Default for AudioManagerOptions {
             use_pii_removal: false,
             filter_music: false,
             use_system_default_audio: true,
+            disable_system_audio: false,
             experimental_coreaudio_system_audio: false,
             transcription_mode: TranscriptionMode::default(),
             meeting_detector: None,
@@ -201,6 +204,11 @@ impl AudioManagerBuilder {
         self
     }
 
+    pub fn disable_system_audio(mut self, disable_system_audio: bool) -> Self {
+        self.options.disable_system_audio = disable_system_audio;
+        self
+    }
+
     pub fn transcription_mode(mut self, transcription_mode: TranscriptionMode) -> Self {
         self.options.transcription_mode = transcription_mode;
         self
@@ -230,6 +238,14 @@ impl AudioManagerBuilder {
         self.validate_options()?;
         let options = &mut self.options;
 
+        if options.disable_system_audio {
+            options.enabled_devices.retain(|device_name| {
+                parse_audio_device(device_name)
+                    .map(|device| device.device_type != DeviceType::Output)
+                    .unwrap_or(true)
+            });
+        }
+
         if !options.is_disabled && options.enabled_devices.is_empty() {
             // Gracefully collect available devices — don't crash if input or output is missing
             // (e.g., Mac Mini with no microphone, headless server with no audio hardware)
@@ -237,8 +253,10 @@ impl AudioManagerBuilder {
             if let Ok(input) = default_input_device() {
                 devices.push(input.to_string());
             }
-            if let Ok(output) = default_output_device().await {
-                devices.push(output.to_string());
+            if !options.disable_system_audio {
+                if let Ok(output) = default_output_device().await {
+                    devices.push(output.to_string());
+                }
             }
             if devices.is_empty() {
                 tracing::warn!(

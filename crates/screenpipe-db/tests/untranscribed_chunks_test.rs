@@ -95,6 +95,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_empty_replacement_marks_chunk_transcribed() {
+        let db = setup_test_db().await;
+
+        let chunk = db.insert_audio_chunk("silent.mp4", None).await.unwrap();
+        db.replace_audio_transcription(
+            chunk,
+            "",
+            "whisper",
+            "test-mic (input)",
+            true,
+            Utc::now(),
+            Some(30.0),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(db.count_audio_transcriptions(chunk).await.unwrap(), 1);
+
+        let since = Utc::now() - Duration::hours(1);
+        let untranscribed = db.get_untranscribed_chunks(since, 100).await.unwrap();
+        assert!(
+            untranscribed.is_empty(),
+            "empty marker rows should prevent shutdown reconciliation loops"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_empty_chunk_and_transcription_insert_marks_chunk_transcribed() {
+        let db = setup_test_db().await;
+
+        let chunk = db
+            .insert_audio_chunk_and_transcription(
+                "silent-hot-path.mp4",
+                "",
+                0,
+                "whisper",
+                &test_device(),
+                None,
+                Some(0.0),
+                Some(30.0),
+                Some(Utc::now()),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(db.count_audio_transcriptions(chunk).await.unwrap(), 1);
+
+        let since = Utc::now() - Duration::hours(1);
+        let untranscribed = db.get_untranscribed_chunks(since, 100).await.unwrap();
+        assert!(
+            untranscribed.is_empty(),
+            "hot-path empty marker rows should prevent shutdown reconciliation loops"
+        );
+    }
+
+    #[tokio::test]
     async fn test_respects_limit() {
         let db = setup_test_db().await;
 

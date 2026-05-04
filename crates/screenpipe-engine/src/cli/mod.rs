@@ -23,7 +23,7 @@ use screenpipe_audio::{
     core::engine::AudioTranscriptionEngine as CoreAudioTranscriptionEngine,
 };
 use screenpipe_core::Language;
-use std::path::PathBuf;
+use std::{collections::HashSet, path::PathBuf};
 
 #[derive(Clone, Debug, ValueEnum, PartialEq)]
 pub enum CliAudioTranscriptionEngine {
@@ -290,6 +290,10 @@ pub struct RecordArgs {
     #[arg(long, default_value_t = true)]
     pub use_system_default_audio: bool,
 
+    /// Disable system/output audio capture while keeping microphone/input audio enabled
+    #[arg(long, default_value_t = false)]
+    pub disable_system_audio: bool,
+
     /// [experimental, macOS 14.4+] Capture System Audio via CoreAudio Process
     /// Tap instead of ScreenCaptureKit. Off by default; ignored on older macOS
     /// and non-macOS.
@@ -319,7 +323,12 @@ pub struct RecordArgs {
     pub use_all_monitors: bool,
 
     /// Languages for OCR/transcription
-    #[arg(short = 'l', long, value_enum)]
+    #[arg(
+        short = 'l',
+        long,
+        value_enum,
+        default_values_t = [Language::Chinese, Language::English]
+    )]
     pub language: Vec<Language>,
 
     /// Enable PII removal
@@ -419,14 +428,17 @@ pub struct RecordArgs {
 }
 
 impl RecordArgs {
+    /// Preserve the CLI language priority while removing duplicates.
+    /// 在去重的同时保留 CLI 的语言优先级顺序，确保 OCR 按用户声明的优先级执行。
     pub fn unique_languages(&self) -> Result<Vec<Language>, String> {
-        let mut unique_langs = std::collections::HashSet::new();
+        let mut unique_langs = HashSet::new();
+        let mut ordered_langs = Vec::new();
         for lang in &self.language {
-            if !unique_langs.insert(lang.clone()) {
-                // continue don't care
+            if unique_langs.insert(lang.clone()) {
+                ordered_langs.push(lang.clone());
             }
         }
-        Ok(unique_langs.into_iter().collect())
+        Ok(ordered_langs)
     }
 
     /// Create UI recorder configuration from record arguments
@@ -465,6 +477,7 @@ impl RecordArgs {
             transcription_mode: mode_str.to_string(),
             audio_devices: self.audio_device.clone(),
             use_system_default_audio: self.use_system_default_audio,
+            disable_system_audio: self.disable_system_audio,
             experimental_coreaudio_system_audio: self.experimental_coreaudio_system_audio,
             monitor_ids: self.monitor_id.iter().map(|id| id.to_string()).collect(),
             // Explicit `--monitor-id` implies opting out of `--use-all-monitors`.
@@ -991,6 +1004,25 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_disable_system_audio_flag_flows_to_recording_settings() {
+        let cli = Cli::try_parse_from(["screenpipe", "record", "--disable-system-audio"]).unwrap();
+        match cli.command {
+            Command::Record(args) => {
+                let settings = args.to_recording_settings();
+                assert!(
+                    settings.disable_system_audio,
+                    "flag should disable system/output audio in settings"
+                );
+                assert!(
+                    !settings.disable_audio,
+                    "system audio disable should keep microphone audio enabled"
+                );
+            }
+            _ => panic!("expected Record command"),
+        }
+    }
+
     /// `--monitor-id` must override the `--use-all-monitors=true` default so
     /// that users restricting capture for privacy actually get only the
     /// monitors they listed. Regression test for Francesco's report
@@ -1037,6 +1069,41 @@ mod tests {
                 let settings = args.to_recording_settings();
                 assert!(settings.use_all_monitors);
                 assert!(settings.monitor_ids.is_empty());
+            }
+            _ => panic!("expected Record command"),
+        }
+    }
+
+    #[test]
+    fn test_default_languages_prioritize_chinese_then_english() {
+        let cli = Cli::try_parse_from(["screenpipe", "record"]).unwrap();
+        match cli.command {
+            Command::Record(args) => {
+                assert_eq!(args.language, vec![Language::Chinese, Language::English]);
+            }
+            _ => panic!("expected Record command"),
+        }
+    }
+
+    #[test]
+    fn unique_languages_preserves_cli_priority_order() {
+        let cli = Cli::try_parse_from([
+            "screenpipe",
+            "record",
+            "--language",
+            "english",
+            "--language",
+            "chinese",
+            "--language",
+            "english",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Record(args) => {
+                assert_eq!(
+                    args.unique_languages().unwrap(),
+                    vec![Language::English, Language::Chinese]
+                );
             }
             _ => panic!("expected Record command"),
         }

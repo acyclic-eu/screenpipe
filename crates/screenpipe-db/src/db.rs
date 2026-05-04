@@ -956,6 +956,24 @@ impl DatabaseManager {
         Ok(rows)
     }
 
+    /// Count audio chunks whose file path starts with the given prefix.
+    /// Used by shutdown to verify the final chunk is visible in the DB before
+    /// handing ownership to reconciliation.
+    pub async fn count_audio_chunks_with_file_prefix(
+        &self,
+        file_path_prefix: &str,
+    ) -> Result<i64, sqlx::Error> {
+        sqlx::query_scalar(
+            "SELECT COUNT(*)
+             FROM audio_chunks
+             WHERE substr(file_path, 1, ?1) = ?2",
+        )
+        .bind(file_path_prefix.len() as i64)
+        .bind(file_path_prefix)
+        .fetch_one(&self.pool)
+        .await
+    }
+
     /// Returns true if there are audio transcriptions from output devices
     /// within the given number of seconds. Used by meeting detection to keep
     /// browser-based meetings alive when the user switches tabs but audio is
@@ -1243,12 +1261,7 @@ impl DatabaseManager {
         duration_secs: Option<f64>,
         speaker_id: Option<i64>,
     ) -> Result<(), sqlx::Error> {
-        // Skip empty transcriptions
         let trimmed = transcription.trim();
-        if trimmed.is_empty() {
-            return Ok(());
-        }
-
         let text_length = trimmed.len() as i64;
         let start_time: f64 = 0.0;
         let end_time: f64 = duration_secs.unwrap_or(0.0);
@@ -3136,9 +3149,12 @@ impl DatabaseManager {
             format!("WHERE {}", conditions.join(" AND "))
         };
 
-        // complete sql with group, order, limit and offset
+        // Group by the transcription row, not chunk+offset. A single audio chunk can
+        // legitimately contain multiple transcription rows with the same offset_index
+        // (for example short trailing segments). Grouping by chunk+offset folds those
+        // rows and makes `/search?content_type=audio` drop audio evidence.
         let sql = format!(
-            "{} {} GROUP BY audio_transcriptions.audio_chunk_id, audio_transcriptions.offset_index ORDER BY audio_transcriptions.timestamp DESC LIMIT ? OFFSET ?",
+            "{} {} GROUP BY audio_transcriptions.id ORDER BY audio_transcriptions.timestamp DESC, audio_transcriptions.id DESC LIMIT ? OFFSET ?",
             base_sql, where_clause
         );
 
