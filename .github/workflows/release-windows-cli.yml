@@ -1,0 +1,73 @@
+name: Release Windows CLI
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - "codex/**"
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    runs-on: windows-2022
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          override: true
+          cache: true
+          target: x86_64-pc-windows-msvc
+          rustflags: ""
+
+      - name: Set up MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Install LLVM and Clang
+        uses: KyleMayes/install-llvm-action@v2
+        with:
+          version: "10.0"
+
+      - name: Build CLI
+        env:
+          CARGO_PROFILE_RELEASE_STRIP: "none"
+          CARGO_PROFILE_RELEASE_PANIC: "abort"
+          CARGO_PROFILE_RELEASE_INCREMENTAL: "false"
+          RUSTFLAGS: "-C target-feature=+crt-static -C link-arg=/LTCG"
+        run: cargo build --release --package screenpipe-server --bin screenpipe --target x86_64-pc-windows-msvc
+
+      - name: Package CLI
+        shell: pwsh
+        run: |
+          $cargoContent = Get-Content "Cargo.toml" -Raw
+          $version = if ($cargoContent -match 'version = "([^"]+)"') { $matches[1] } else { "0.0.0" }
+          $targetDir = "target/x86_64-pc-windows-msvc/release"
+          $packageName = "screenpipe-$version-x86_64-pc-windows-msvc"
+          $packageDir = Join-Path $PWD $packageName
+          New-Item -Path "$packageDir/bin" -ItemType Directory -Force
+          Copy-Item "$targetDir/screenpipe.exe" "$packageDir/bin/"
+          Get-ChildItem $targetDir -Filter "*.dll" -File | Copy-Item -Destination "$packageDir/bin/"
+          Compress-Archive -Path "$packageDir/*" -DestinationPath "$packageName.zip" -Force
+          "SCREENPIPE_PACKAGE=$packageName.zip" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: screenpipe-windows
+          path: ${{ env.SCREENPIPE_PACKAGE }}
+
+      - name: Update cli-latest release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: pwsh
+        run: |
+          gh release delete cli-latest --yes 2>$null
+          gh release create cli-latest --title "CLI latest" --notes "Latest Windows CLI build from $env:GITHUB_SHA" --prerelease
+          gh release upload cli-latest "$env:SCREENPIPE_PACKAGE" --clobber
