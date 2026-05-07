@@ -41,7 +41,7 @@ jobs:
           CARGO_PROFILE_RELEASE_PANIC: "abort"
           CARGO_PROFILE_RELEASE_INCREMENTAL: "false"
           RUSTFLAGS: "-C target-feature=+crt-static -C link-arg=/LTCG"
-        run: cargo build --release --package screenpipe-server --bin screenpipe --target x86_64-pc-windows-msvc
+        run: cargo build --release --package screenpipe-engine --bin screenpipe --target x86_64-pc-windows-msvc
 
       - name: Package CLI
         shell: pwsh
