@@ -26,13 +26,13 @@ cargo build --release
   --disable-audio \
   --fps 1 \
   --language chinese \
-  --language english \
-  --enable-ui-events
+  --language english
 ```
 
 主要适配内容包括：稳定的中英文 OCR 语言顺序、macOS Apple Vision
 语言代码处理、`--disable-system-audio`、最终音频片段 flush、音频搜索和空转写
-marker 修复，以及 OysterWorkflow ingest 所需的 UI events 兼容性。
+marker 修复，以及 OysterWorkflow ingest 所需的 UI events 兼容性；当前 recorder
+配置会启用 UI event capture，不需要额外传旧版 UI 参数。
 
 感谢原始 Screenpipe 项目作者
 [louis030195](https://github.com/louis030195)、

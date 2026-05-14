@@ -33,8 +33,7 @@ cargo build --release
   --disable-audio \
   --fps 1 \
   --language chinese \
-  --language english \
-  --enable-ui-events
+  --language english
 ```
 
 ## What This Fork Changes
@@ -54,7 +53,8 @@ OysterWorkflow. The main compatibility changes are:
 - empty transcription marker rows so silent chunks do not cause repeated
   reconciliation loops
 - UI events and input-monitoring compatibility retained for OysterWorkflow
-  ingest via `http://localhost:3030`
+  ingest via `http://localhost:3030`; the recorder config enables UI event
+  capture without requiring an extra CLI flag
 
 ## Attribution And License
 

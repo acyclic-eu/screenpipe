@@ -1,0 +1,45 @@
+name: OysterWorkflow Compatibility CI
+
+on:
+  push:
+    branches:
+      - oysterworkflow-compatible-v0.3.304
+  pull_request:
+    branches:
+      - oysterworkflow-compatible-v0.3.304
+  workflow_dispatch:
+
+env:
+  GIT_LFS_SKIP_SMUDGE: 1
+  CARGO_TERM_COLOR: always
+
+jobs:
+  compatibility:
+    name: CLI Compatibility
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          override: true
+          rustflags: ""
+
+      - name: Check CLI help exposes OysterWorkflow defaults
+        run: |
+          cargo build -p screenpipe-engine --bin screenpipe
+          ./target/debug/screenpipe record --help | grep "default: chinese english"
+          ./target/debug/screenpipe record --help | grep -- "--disable-system-audio"
+
+      - name: Test language ordering
+        run: cargo test -p screenpipe-engine unique_languages_preserves_cli_priority_order
+
+      - name: Test default language order
+        run: cargo test -p screenpipe-engine test_default_languages_prioritize_chinese_then_english
+
+      - name: Test system-audio flag
+        run: cargo test -p screenpipe-engine test_disable_system_audio_flag_flows_to_recording_settings

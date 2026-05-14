@@ -1,6 +1,10 @@
 name: Code Quality & Optimization
 
-on: [push, pull_request]
+on:
+  # Kept from upstream for manual maintenance checks. The OysterWorkflow fork
+  # runs a smaller compatibility workflow on push so public default-branch checks
+  # stay focused on the recorder contract used by OysterWorkflow Core.
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
