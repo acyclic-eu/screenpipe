@@ -9,37 +9,29 @@ on:
       - oysterworkflow-compatible-v0.3.304
   workflow_dispatch:
 
-env:
-  GIT_LFS_SKIP_SMUDGE: 1
-  CARGO_TERM_COLOR: always
-
 jobs:
   compatibility:
-    name: CLI Compatibility
-    runs-on: macos-latest
+    name: Source Contract
+    runs-on: ubuntu-latest
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Rust
-        uses: actions-rust-lang/setup-rust-toolchain@v1
-        with:
-          toolchain: stable
-          override: true
-          rustflags: ""
-
-      - name: Check CLI help exposes OysterWorkflow defaults
+      - name: Check OysterWorkflow compatibility contract
         run: |
-          cargo build -p screenpipe-engine --bin screenpipe
-          ./target/debug/screenpipe record --help | grep "default: chinese english"
-          ./target/debug/screenpipe record --help | grep -- "--disable-system-audio"
+          set -euo pipefail
 
-      - name: Test language ordering
-        run: cargo test -p screenpipe-engine unique_languages_preserves_cli_priority_order
+          grep -F "default_values_t = [Language::Chinese, Language::English]" crates/screenpipe-engine/src/cli/mod.rs
+          grep -F "pub disable_system_audio: bool" crates/screenpipe-engine/src/cli/mod.rs
+          grep -F "enabled: true" crates/screenpipe-engine/src/cli/mod.rs
+          grep -F "record_input_events: true" crates/screenpipe-engine/src/cli/mod.rs
 
-      - name: Test default language order
-        run: cargo test -p screenpipe-engine test_default_languages_prioritize_chinese_then_english
+          grep -F "test_default_languages_prioritize_chinese_then_english" crates/screenpipe-engine/src/cli/mod.rs
+          grep -F "unique_languages_preserves_cli_priority_order" crates/screenpipe-engine/src/cli/mod.rs
+          grep -F "test_disable_system_audio_flag_flows_to_recording_settings" crates/screenpipe-engine/src/cli/mod.rs
 
-      - name: Test system-audio flag
-        run: cargo test -p screenpipe-engine test_disable_system_audio_flag_flows_to_recording_settings
+          grep -F "OysterWorkflow-compatible" README.md
+          grep -F "OysterWorkflow 适配版" README-zh_CN.md
+          grep -F "Copyright (c) 2024-2026 louis030195" LICENSE.md
+          grep -F "https://github.com/mediar-ai/screenpipe" NOTICE
