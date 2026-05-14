@@ -1,0 +1,11 @@
+OysterWorkflow-compatible Screenpipe
+
+This repository is a fork of Screenpipe:
+https://github.com/mediar-ai/screenpipe
+
+Original Screenpipe copyright is retained in LICENSE.md:
+Copyright (c) 2024-2026 louis030195
+
+The fork is maintained by Shuxin Yang for OysterWorkflow compatibility. The root
+project remains under the upstream MIT License. The ee/ directory remains under
+the upstream Screenpipe Enterprise Edition License.

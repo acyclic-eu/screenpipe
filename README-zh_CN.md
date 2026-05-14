@@ -1,3 +1,46 @@
+<h1 align="center">OysterWorkflow 适配版 Screenpipe</h1>
+
+这是 ShuxinYang111 维护的
+[screenpipe](https://github.com/mediar-ai/screenpipe) fork，基于上游
+Screenpipe `v0.3.304` 系列，面向
+[OysterWorkflow Core](https://github.com/ShuxinYang111/oysterworkflow-core)
+做了兼容适配。
+
+推荐用户直接在 OysterWorkflow Core 仓库中执行：
+
+```bash
+npm run screenpipe:install
+npm run screenpipe:start
+```
+
+手动源码构建方式：
+
+```bash
+git clone https://github.com/ShuxinYang111/screenpipe.git
+cd screenpipe
+git checkout oysterworkflow-compatible-v0.3.304
+cargo build --release
+
+./target/release/screenpipe \
+  --port 3030 \
+  --disable-audio \
+  --fps 1 \
+  --language chinese \
+  --language english \
+  --enable-ui-events
+```
+
+主要适配内容包括：稳定的中英文 OCR 语言顺序、macOS Apple Vision
+语言代码处理、`--disable-system-audio`、最终音频片段 flush、音频搜索和空转写
+marker 修复，以及 OysterWorkflow ingest 所需的 UI events 兼容性。
+
+感谢原始 Screenpipe 项目作者
+[louis030195](https://github.com/louis030195)、
+[Mediar](https://github.com/mediar-ai) 和所有 Screenpipe 贡献者。根目录代码仍保留
+上游 MIT License，`ee/` 目录仍保留 Screenpipe Enterprise Edition License。
+
+---
+
 <img referrerpolicy="no-referrer-when-downgrade" src="https://static.scarf.sh/a.png?x-pxid=c3628864-a0cb-47a1-a822-2f936cff50b2" />
 
 <p align="center">

@@ -1,4 +1,74 @@
 
+<h1 align="center">OysterWorkflow-compatible Screenpipe</h1>
+
+This repository is ShuxinYang111's OysterWorkflow-compatible fork of
+[screenpipe](https://github.com/mediar-ai/screenpipe), based on the upstream
+Screenpipe `v0.3.304` line.
+
+Use this build when running
+[OysterWorkflow Core](https://github.com/ShuxinYang111/oysterworkflow-core).
+It keeps Screenpipe's local-first recording model and exposes the same local
+HTTP API expected by OysterWorkflow Core at `http://localhost:3030`.
+
+## OysterWorkflow Quick Start
+
+From the OysterWorkflow Core repository, users can install and run this
+compatible Screenpipe build without manually cloning this repository:
+
+```bash
+npm run screenpipe:install
+npm run screenpipe:start
+```
+
+Manual source build:
+
+```bash
+git clone https://github.com/ShuxinYang111/screenpipe.git
+cd screenpipe
+git checkout oysterworkflow-compatible-v0.3.304
+cargo build --release
+
+./target/release/screenpipe \
+  --port 3030 \
+  --disable-audio \
+  --fps 1 \
+  --language chinese \
+  --language english \
+  --enable-ui-events
+```
+
+## What This Fork Changes
+
+This fork exists to make Screenpipe easier to use as the recorder backend for
+OysterWorkflow. The main compatibility changes are:
+
+- stable OCR language ordering for Chinese and English, including Apple Vision
+  language-code handling on macOS
+- default `record` language order aligned with OysterWorkflow's Chinese/English
+  extraction workflow
+- `--disable-system-audio` support, so users can turn off system/output audio
+  while keeping microphone/input capture available when needed
+- shutdown and reconciliation fixes so final partial audio chunks are flushed
+  and visible to downstream consumers
+- audio search fixes for multiple transcription rows in the same chunk
+- empty transcription marker rows so silent chunks do not cause repeated
+  reconciliation loops
+- UI events and input-monitoring compatibility retained for OysterWorkflow
+  ingest via `http://localhost:3030`
+
+## Attribution And License
+
+This is a fork of the original Screenpipe project by
+[louis030195](https://github.com/louis030195),
+[Mediar](https://github.com/mediar-ai), and the Screenpipe contributors.
+Thank you to the upstream authors for building and maintaining Screenpipe.
+
+The root project remains under the upstream MIT License. The `ee/` directory
+keeps the upstream Screenpipe Enterprise Edition License. See
+[LICENSE.md](./LICENSE.md), [ee/LICENSE](./ee/LICENSE), and [NOTICE](./NOTICE).
+
+---
+
 <p align="center">
    <a href ="https://screenpi.pe">
       <img src="https://github.com/user-attachments/assets/d3b1de26-c3c0-4c84-b9c4-b03213b97a30" alt="logo" width="200">

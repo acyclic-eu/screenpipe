@@ -81,3 +81,8 @@ apps/screenpipe-app-tauri/src-tauri/openblas/
 apps/screenpipe-app-tauri/src-tauri/mlx.metallib
 .serena/
 .worktrees/
+
+# Local agent/workspace notes
+.agents/
+AGENTS.md
+plan/
