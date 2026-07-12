@@ -52,6 +52,16 @@ pub enum CliAudioTranscriptionEngine {
     Disabled,
 }
 
+#[derive(Clone, Debug, ValueEnum, PartialEq)]
+pub enum CliPermissionKind {
+    #[clap(name = "screen-recording")]
+    ScreenRecording,
+    #[clap(name = "accessibility")]
+    Accessibility,
+    #[clap(name = "input-monitoring")]
+    InputMonitoring,
+}
+
 /// Default audio engine based on hardware tier.
 ///
 /// - Low tier (≤8GB): WhisperTiny (parakeet-mlx would OOM)
@@ -242,11 +252,14 @@ pub enum Command {
     /// Check system readiness (permissions, ffmpeg, etc.)
     Doctor,
 
-    /// Read permission status without requesting access or opening System Settings
+    /// Read permission status, or explicitly request one permission
     Permissions {
         /// Output a machine-readable JSON object
         #[arg(long, default_value_t = false)]
         json: bool,
+        /// Request one permission. Omit this flag for a non-prompting status check.
+        #[arg(long, value_enum)]
+        request: Option<CliPermissionKind>,
     },
 
     /// Manage local API authentication

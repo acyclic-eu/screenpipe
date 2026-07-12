@@ -93,6 +93,14 @@ pub mod stub {
             self.check_permissions()
         }
 
+        pub fn request_accessibility_permission(&self) -> bool {
+            false
+        }
+
+        pub fn request_input_monitoring_permission(&self) -> bool {
+            false
+        }
+
         pub fn start(&self) -> Result<RecordingHandle> {
             anyhow::bail!("UI event capture not supported on this platform")
         }

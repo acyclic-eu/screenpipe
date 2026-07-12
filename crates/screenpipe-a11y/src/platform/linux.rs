@@ -130,6 +130,14 @@ impl UiRecorder {
         perms
     }
 
+    pub fn request_accessibility_permission(&self) -> bool {
+        self.check_permissions().accessibility
+    }
+
+    pub fn request_input_monitoring_permission(&self) -> bool {
+        self.check_permissions().input_monitoring
+    }
+
     pub fn start(&self) -> Result<RecordingHandle> {
         let (handle, _) = self.start_internal(None)?;
         Ok(handle)

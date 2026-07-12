@@ -113,9 +113,19 @@ impl UiRecorder {
     /// Request permissions (shows system dialogs)
     pub fn request_permissions(&self) -> PermissionStatus {
         PermissionStatus {
-            accessibility: ax::is_process_trusted_with_prompt(true),
-            input_monitoring: cg_access::listen_request(),
+            accessibility: self.request_accessibility_permission(),
+            input_monitoring: self.request_input_monitoring_permission(),
         }
+    }
+
+    /// Request Accessibility access for the recorder process.
+    pub fn request_accessibility_permission(&self) -> bool {
+        ax::is_process_trusted_with_prompt(true)
+    }
+
+    /// Request Input Monitoring access for the recorder process.
+    pub fn request_input_monitoring_permission(&self) -> bool {
+        cg_access::listen_request()
     }
 
     /// Start capturing events (without activity feed)

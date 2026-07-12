@@ -123,6 +123,14 @@ impl UiRecorder {
         self.check_permissions()
     }
 
+    pub fn request_accessibility_permission(&self) -> bool {
+        true
+    }
+
+    pub fn request_input_monitoring_permission(&self) -> bool {
+        true
+    }
+
     /// Start capturing events (without activity feed)
     pub fn start(&self) -> Result<RecordingHandle> {
         let (handle, _) = self.start_internal(None)?;

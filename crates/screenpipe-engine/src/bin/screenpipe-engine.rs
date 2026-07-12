@@ -29,7 +29,7 @@ use screenpipe_engine::{
         status::handle_status_command,
         sync::{handle_sync_command, start_sync_service},
         vision::handle_vision_command,
-        Cli, CliAudioTranscriptionEngine, Command,
+        Cli, CliAudioTranscriptionEngine, CliPermissionKind, Command,
     },
     hot_frame_cache::HotFrameCache,
     start_meeting_watcher, start_power_manager, start_sleep_monitor, start_speaker_identification,
@@ -369,9 +369,36 @@ async fn main() -> anyhow::Result<()> {
             }
             return Ok(());
         }
-        Command::Permissions { json: json_output } => {
+        Command::Permissions {
+            json: json_output,
+            request,
+        } => {
             use screenpipe_a11y::UiRecorder;
             use screenpipe_core::permissions::{check_permissions, PermissionStatus};
+
+            if let Some(requested_permission) = request {
+                let recorder = UiRecorder::with_defaults();
+                match requested_permission {
+                    CliPermissionKind::ScreenRecording => {
+                        #[cfg(target_os = "macos")]
+                        {
+                            #[link(name = "CoreGraphics", kind = "framework")]
+                            extern "C" {
+                                fn CGRequestScreenCaptureAccess() -> bool;
+                            }
+                            unsafe {
+                                CGRequestScreenCaptureAccess();
+                            }
+                        }
+                    }
+                    CliPermissionKind::Accessibility => {
+                        recorder.request_accessibility_permission();
+                    }
+                    CliPermissionKind::InputMonitoring => {
+                        recorder.request_input_monitoring_permission();
+                    }
+                }
+            }
 
             let system = check_permissions();
             let ui = UiRecorder::with_defaults().check_permissions();
