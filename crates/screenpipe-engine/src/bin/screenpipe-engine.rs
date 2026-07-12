@@ -369,6 +369,33 @@ async fn main() -> anyhow::Result<()> {
             }
             return Ok(());
         }
+        Command::Permissions { json: json_output } => {
+            use screenpipe_a11y::UiRecorder;
+            use screenpipe_core::permissions::{check_permissions, PermissionStatus};
+
+            let system = check_permissions();
+            let ui = UiRecorder::with_defaults().check_permissions();
+            let status_label = |status: PermissionStatus| match status {
+                PermissionStatus::Granted | PermissionStatus::NotNeeded => "granted",
+                PermissionStatus::NotDetermined => "not-determined",
+                PermissionStatus::Denied => "missing",
+            };
+            let payload = json!({
+                "screenRecording": status_label(system.screen_recording),
+                "microphone": status_label(system.microphone),
+                "accessibility": if ui.accessibility { "granted" } else { "missing" },
+                "inputMonitoring": if ui.input_monitoring { "granted" } else { "missing" },
+            });
+            if json_output {
+                println!("{}", payload);
+            } else {
+                println!("screen recording: {}", payload["screenRecording"]);
+                println!("accessibility: {}", payload["accessibility"]);
+                println!("input monitoring: {}", payload["inputMonitoring"]);
+                println!("microphone: {}", payload["microphone"]);
+            }
+            return Ok(());
+        }
         Command::Record(args) => args,
     };
 
@@ -1017,8 +1044,8 @@ async fn main() -> anyhow::Result<()> {
     // frontmatter can run. Routed through the gateway by default; self-host
     // can override with SCREENPIPE_EVENT_CLASSIFIER_URL.
     if config.enable_workflow_events {
-        let classifier_url = std::env::var("SCREENPIPE_EVENT_CLASSIFIER_URL")
-            .unwrap_or_else(|_| {
+        let classifier_url =
+            std::env::var("SCREENPIPE_EVENT_CLASSIFIER_URL").unwrap_or_else(|_| {
                 screenpipe_engine::workflow_classifier::DEFAULT_CLASSIFIER_URL.to_string()
             });
         let token = user_token.clone().unwrap_or_default();

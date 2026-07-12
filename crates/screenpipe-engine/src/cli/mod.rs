@@ -242,6 +242,13 @@ pub enum Command {
     /// Check system readiness (permissions, ffmpeg, etc.)
     Doctor,
 
+    /// Read permission status without requesting access or opening System Settings
+    Permissions {
+        /// Output a machine-readable JSON object
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+
     /// Manage local API authentication
     Auth {
         #[command(subcommand)]
