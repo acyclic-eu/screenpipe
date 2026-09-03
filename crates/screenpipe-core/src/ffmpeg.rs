@@ -48,6 +48,16 @@ pub fn ffmpeg_cmd_async(path: impl AsRef<std::ffi::OsStr>) -> tokio::process::Co
 /// `get_ffprobe_path`. Callers should fall through to the next discovery
 /// source when this returns false.
 fn has_matching_ffprobe(ffmpeg_path: &std::path::Path) -> bool {
+    // Check PATH first - standard Unix convention
+    #[cfg(not(windows))]
+    let probe_name = "ffprobe";
+    #[cfg(windows)]
+    let probe_name = "ffprobe.exe";
+    if which(probe_name).is_ok() {
+        return true;
+    }
+
+    // Fall back to sibling directory check
     #[cfg(windows)]
     let sibling_names = ["ffprobe.exe", "ffprobe"];
     #[cfg(not(windows))]
@@ -59,11 +69,7 @@ fn has_matching_ffprobe(ffmpeg_path: &std::path::Path) -> bool {
         }
     }
 
-    #[cfg(not(windows))]
-    let probe_name = "ffprobe";
-    #[cfg(windows)]
-    let probe_name = "ffprobe.exe";
-    which(probe_name).is_ok()
+    false
 }
 
 fn find_ffmpeg_path_internal() -> Option<PathBuf> {
